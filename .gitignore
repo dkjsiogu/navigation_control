@@ -1,0 +1,30 @@
+# ROS2 构建产物
+build/
+install/
+log/
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C++编译产物
+*.o
+*.so
+*.a
+*.out
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 地图文件（可选：如果地图很大，建议ignore）
+# maps/*.pbstream
+
+# 系统文件
+.DS_Store
+Thumbs.db
