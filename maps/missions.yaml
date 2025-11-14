@@ -1,0 +1,33 @@
+missions:
+  # 自动取物任务
+  auto_pickup:
+    description: "自动到 waypoint_1 并启动颜色跟踪"
+    tasks:
+      - type: goto
+        waypoint: waypoint_1
+      - type: wait
+        duration: 1.0
+      - type: start_vision
+        task_id: 1
+  
+  # 返回起点
+  return_home:
+    description: "返回起点"
+    tasks:
+      - type: goto
+        waypoint: start
+      - type: rotate
+        yaw: 0.0
+  
+  # 完整工作流程
+  complete_workflow:
+    description: "完整工作流程 - 去取物再返回"
+    tasks:
+      - type: goto
+        waypoint: waypoint_1
+      - type: wait
+        duration: 20.0
+      - type: goto
+        waypoint: start
+      - type: rotate
+        yaw: 0.0

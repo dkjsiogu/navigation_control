@@ -87,6 +87,9 @@ install(PROGRAMS
   scripts/astar_planner.py
   scripts/simple_goal_controller.py
   scripts/map_republisher.py
+  scripts/icp_relocalization.py
+  scripts/waypoint_manager.py
+  scripts/mission_controller.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

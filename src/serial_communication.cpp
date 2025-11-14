@@ -78,9 +78,9 @@ public:
                 std::bind(&SerialCommunication::tryReconnect, this));
         }
         
-        RCLCPP_INFO(this->get_logger(), "Serial Communication Node initialized");
-        RCLCPP_INFO(this->get_logger(), "Serial port: %s", serial_port_.c_str());
-        RCLCPP_INFO(this->get_logger(), "Baudrate: %d", baudrate_);
+        // RCLCPP_INFO(this->get_logger(), "Serial Communication Node initialized");
+        // RCLCPP_INFO(this->get_logger(), "Serial port: %s", serial_port_.c_str());
+        // RCLCPP_INFO(this->get_logger(), "Baudrate: %d", baudrate_);
         
         // 尝试打开串口
         openSerialPort();
@@ -181,7 +181,7 @@ private:
             bytes_sent_ += msg->data.size();
             packets_sent_++;
             
-            RCLCPP_DEBUG(this->get_logger(), "Sent %zu bytes to serial port", msg->data.size());
+            //RCLCPP_DEBUG(this->get_logger(), "Sent %zu bytes to serial port", msg->data.size());
             
         } catch (const std::exception& e) {
             RCLCPP_ERROR(this->get_logger(), "Error sending data: %s", e.what());
@@ -234,8 +234,8 @@ private:
                 serial_rx_hex_pub_->publish(hex_msg);
                 
                 // 改为DEBUG级别，避免日志刷屏
-                RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes: %s", 
-                            buffer.size(), hex_msg.data.c_str());
+                //RCLCPP_DEBUG(this->get_logger(), "Received %zu bytes: %s", 
+                //            buffer.size(), hex_msg.data.c_str());
             }
             
         } catch (const std::exception& e) {
@@ -279,7 +279,7 @@ private:
         connection_status_pub_->publish(msg);
         
         // 打印到控制台
-        RCLCPP_INFO(this->get_logger(), "%s", msg.data.c_str());
+        //RCLCPP_INFO(this->get_logger(), "%s", msg.data.c_str());
     }
     
     // 成员变量

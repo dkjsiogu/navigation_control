@@ -1,0 +1,16 @@
+waypoints:
+  start:
+    description: ''
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+  waypoint_1:
+    description: ''
+    x: 2.1263640157747745
+    y: -0.7346934956581607
+    yaw: -0.002270344772337759
+  waypoint_3:
+    description: ''
+    x: -2.103450889563855
+    y: 0.6999445087088709
+    yaw: 3.1209389218526247

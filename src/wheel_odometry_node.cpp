@@ -129,11 +129,14 @@ public:
         this->declare_parameter("base_frame", "base_link");
         this->declare_parameter("publish_tf", true);
         this->declare_parameter("enable_crc_check", true);
+        this->declare_parameter("imu_drift_compensation_deg_per_min", 0.5);  // 每分钟补偿角度(度)
         
         odom_frame_ = this->get_parameter("odom_frame").as_string();
         base_frame_ = this->get_parameter("base_frame").as_string();
         publish_tf_ = this->get_parameter("publish_tf").as_bool();
         enable_crc_check_ = this->get_parameter("enable_crc_check").as_bool();
+        imu_drift_compensation_rate_ = this->get_parameter("imu_drift_compensation_deg_per_min").as_double() 
+                                       * (M_PI / 180.0) / 60.0;  // 转换为 rad/s
         
         // 订阅串口接收数据
         serial_rx_sub_ = this->create_subscription<std_msgs::msg::UInt8MultiArray>(
@@ -159,11 +162,14 @@ public:
                      std::placeholders::_1, std::placeholders::_2));
         
         // 定时器 - 发布统计信息
-        stats_timer_ = this->create_wall_timer(
-            5s, std::bind(&WheelOdometryNode::publishStats, this));
+        //stats_timer_ = this->create_wall_timer(
+        //    5s, std::bind(&WheelOdometryNode::publishStats, this));
         
         // 初始化位姿
         resetOdometry();
+        
+        // 记录启动时间（用于IMU漂移补偿计算）
+        imu_compensation_start_time_ = this->now();
         
         RCLCPP_INFO(this->get_logger(), "===================================");
         RCLCPP_INFO(this->get_logger(), "轮式里程计节点已启动");
@@ -171,6 +177,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "Base frame: %s", base_frame_.c_str());
         RCLCPP_INFO(this->get_logger(), "Publish TF: %s", publish_tf_ ? "YES" : "NO");
         RCLCPP_INFO(this->get_logger(), "CRC Check: %s", enable_crc_check_ ? "ENABLED" : "DISABLED");
+        RCLCPP_INFO(this->get_logger(), "IMU Drift Compensation: %.2f°/min (%.6f rad/s)", 
+                   imu_drift_compensation_rate_ * 60.0 * 180.0 / M_PI, imu_drift_compensation_rate_);
         RCLCPP_INFO(this->get_logger(), "===================================");
     }
 
@@ -255,6 +263,21 @@ private:
         // 3.5 读取IMU yaw角（用于后面计算变化量）
         double imu_yaw = packet.yaw;  // IMU航向角 (rad)
         
+        // 3.6 应用IMU漂移补偿（基于运行时间累积）
+        double elapsed_time = (current_time - imu_compensation_start_time_).seconds();
+        double drift_compensation = elapsed_time * imu_drift_compensation_rate_;  // 累计补偿量 (rad)
+        imu_yaw += drift_compensation;  // 应用补偿
+        
+        // 每60秒输出一次补偿信息
+        static int compensation_log_counter = 0;
+        if (++compensation_log_counter >= 600) {  // 假设数据包频率~10Hz，600次≈60秒
+            compensation_log_counter = 0;
+            RCLCPP_INFO(this->get_logger(), 
+                       "[IMU补偿] 运行时间: %.1fs | 累计补偿: %.2f° | 原始yaw: %.2f° | 补偿后yaw: %.2f°",
+                       elapsed_time, drift_compensation * 180.0 / M_PI,
+                       packet.yaw * 180.0 / M_PI, imu_yaw * 180.0 / M_PI);
+        }
+        
         // 4. 速度死区过滤（过滤编码器噪声）
         const double VEL_THRESHOLD = 0.001;    // 1mm/s
         const double ANGULAR_THRESHOLD = 0.001; // ~0.06°/s
@@ -276,8 +299,11 @@ private:
             current_vy_ *= 0.7;
             current_wz_ *= 0.7;
             
-            // ⚠️ 静止时不积分位姿，同时冻结IMU Yaw更新（防止陀螺仪漂移累积）
-            // 保持 last_imu_yaw_ 不变，下次运动时会自动同步
+            // ⚠️ 静止时冻结IMU Yaw更新（防止陀螺仪漂移累积）
+            // 更新 last_imu_yaw_ 为当前值，但不累积到 current_theta_
+            // 这样下次运动时 delta_yaw 会从当前IMU值开始计算，自动同步
+            last_imu_yaw_ = imu_yaw;
+            last_imu_yaw_valid_ = true;
             
             publishDebugData(packet, 0.0, 0.0, 0.0, dt, true, false, false);
             publishOdometry();
@@ -507,6 +533,8 @@ private:
     std::string base_frame_;
     bool publish_tf_;
     bool enable_crc_check_;
+    double imu_drift_compensation_rate_;  // IMU漂移补偿速率 (rad/s)
+    rclcpp::Time imu_compensation_start_time_{0, 0, RCL_ROS_TIME};  // 补偿计时起点
     
     // 当前位姿 (世界坐标系 - odom frame)
     double current_x_{0.0};

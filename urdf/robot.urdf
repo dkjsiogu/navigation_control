@@ -6,7 +6,7 @@
     <visual>
       <geometry>
         <!-- 长262mm 宽270mm -->
-        <box size="0.340 0.300 0.050"/>
+        <box size="0.262 0.270 0.050"/>
       </geometry>
       <origin xyz="0 0 0.025" rpy="0 0 0"/>
       <material name="blue">

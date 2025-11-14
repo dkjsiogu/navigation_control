@@ -14,6 +14,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import String
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -46,6 +47,7 @@ class SimpleGoalController(Node):
         
         # 发布速度命令
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.goal_status_pub = self.create_publisher(String, '/goal_status', 10)
         
         # TF监听器 - 用于获取 map -> base_link 变换
         self.tf_buffer = Buffer()
@@ -153,6 +155,12 @@ class SimpleGoalController(Node):
         if dist_to_goal < self.goal_tolerance:
             self.get_logger().info('🎯 到达目标！')
             self.publish_velocity(0.0, 0.0, 0.0)
+            
+            # 发布到达信号给任务控制器
+            status_msg = String()
+            status_msg.data = 'reached'
+            self.goal_status_pub.publish(status_msg)
+            
             self.current_path = None
             return
         

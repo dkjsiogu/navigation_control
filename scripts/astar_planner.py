@@ -48,10 +48,10 @@ class AStarPlanner(Node):
         # 对角线半径（用于快速碰撞初筛）
         self.robot_diagonal_radius = math.sqrt(self.robot_half_length**2 + self.robot_half_width**2)
         
-        # 订阅地图
+        # 订阅地图 (使用map_viz而非map)
         self.map_sub = self.create_subscription(
             OccupancyGrid,
-            '/map',
+            '/map_viz',
             self.map_callback,
             10
         )
@@ -94,8 +94,8 @@ class AStarPlanner(Node):
         # OccupancyGrid: -1=未知, 0=自由, 100=占用
         self.map_data = np.array(msg.data).reshape((height, width))
         
-        self.get_logger().info(f'地图已更新: {width}x{height}, 分辨率={msg.info.resolution}m', 
-                               throttle_duration_sec=5.0)
+        #self.get_logger().info(f'地图已更新: {width}x{height}, 分辨率={msg.info.resolution}m', 
+        #                       throttle_duration_sec=5.0)
     
     def is_footprint_collision_free(self, x_world, y_world, yaw=0.0):
         """检查机器人矩形footprint是否与障碍物碰撞

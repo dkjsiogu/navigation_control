@@ -1,0 +1,91 @@
+# SLAM Toolbox 纯定位配置
+# 功能: 加载已保存的地图进行定位,不建图
+
+slam_toolbox:
+  ros__parameters:
+    # === 基础设置 ===
+    use_sim_time: false
+    
+    # === 定位模式设置 ===
+    mode: localization  # 纯定位模式
+    
+    # === 地图加载设置 ===
+    # 注意: SLAM Toolbox 不发布地图,只提供定位 (TF: map->odom)
+    # 地图由 map_server 从 pgm+yaml 加载并发布到 /map
+    
+    # === 坐标系设置 ===
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    
+    # === 传感器设置 ===
+    scan_topic: /scan
+    use_scan_matching: true
+    use_scan_barycenter: true
+    
+    # === 自动定位设置 ===
+    # 启用自动初始定位（不依赖 /initialpose）
+    do_loop_closing: true
+    
+    # 定位参数 - 不设置固定初始位姿，让系统自动匹配
+    # initial_pose_x, initial_pose_y, initial_pose_yaw 不设置
+    # SLAM Toolbox 会通过激光扫描匹配自动找到位置
+    
+    # === 扫描匹配参数 (高精度轮式里程计优化) ===
+    minimum_travel_distance: 0.05   # 🔧 降低到5cm，更频繁更新定位
+    minimum_travel_heading: 0.1     # 🔧 降低到0.1rad=5.7度
+    scan_buffer_size: 20           # 🔧 增加缓冲区,利用里程计积累更多数据
+    scan_buffer_maximum_scan_distance: 15.0  # 增加到15m
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 6.0         # 🔧 增加到6m (里程计准,可搜更远)
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 6          # 🔧 降低到6 (里程计稳定,易闭合)
+    loop_match_maximum_variance_coarse: 2.0   # 🔧 更严格 (信任里程计)
+    loop_match_minimum_response_coarse: 0.45  # 🔧 提高阈值 (质量优先)
+    loop_match_minimum_response_fine: 0.55    # 🔧 提高精细匹配阈值
+    
+    # === 相关扫描匹配参数 (信任高精度里程计) ===
+    correlation_search_space_dimension: 0.3       # 🔧 缩小到0.3m (里程计准,无需大范围搜索)
+    correlation_search_space_resolution: 0.005    # 保持5mm高精度
+    correlation_search_space_smear_deviation: 0.03 # 🔧 进一步减小模糊
+    
+    # === 循环闭合参数 ===
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+    loop_search_maximum_distance: 5.0         # 增大 (新增参数)
+    
+    # === 扫描匹配器参数 (里程计高精度权重) ===
+    distance_variance_penalty: 0.3      # 🔧 降低距离惩罚 (信任里程计)
+    angle_variance_penalty: 0.8         # 🔧 降低角度惩罚
+    
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+    
+    # === 优化参数 (配合高精度里程计) ===
+    max_laser_range: 12.0  # 激光最大距离
+    minimum_time_interval: 0.5  # 0.5秒最小间隔
+    transform_publish_period: 0.02  # 50Hz发布TF (匹配里程计频率)
+    transform_timeout: 0.5          # 🔧 延长超时 (信任里程计连续性)
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    
+    # === 调试选项 ===
+    enable_interactive_mode: true   # 启用交互模式,允许动态调整
+    debug_logging: false
+    throttle_scans: 1
+    
+    # === 地图发布和动态维护 ===
+    map_update_interval: 1.0        # 地图更新间隔(秒) - 更频繁更新
+    publish_occupancy_map: true     # 发布占用栅格地图到 /slam_map
+    map_always_update: true         # 始终更新地图 (动态维护!)
+    
+    # === 地图裁剪控制 (保持完整地图) ===
+    # 禁用地图裁剪,保持完整地图
+    enable_interactive_mode: false
+    map_update_interval: 0.0  # 禁用动态地图更新
