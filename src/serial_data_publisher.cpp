@@ -165,7 +165,8 @@ private:
     // 颜色跟踪结果回调
     void colorTrackingCallback(const std_msgs::msg::String::SharedPtr msg)
     {
-        // 解析 get-toy 发布的字符串: "1.00,0.52,120" (status,rad,y_offset)
+        // 解析统一格式: "status,rad,y_offset"
+        // status: 0.00=无效 1.00=彩色跟踪 2.00=黑色检测
         std::istringstream iss(msg->data);
         std::string status_str, rad_str, dy_str;
         
@@ -175,21 +176,27 @@ private:
             
             try {
                 float status = std::stof(status_str);
-                tracking_valid_ = (status > 0.5f);  // > 0.5 认为有效
+                tracking_status_ = status;  // 保存原始状态值
+                tracking_valid_ = (status > 0.5f);  // > 0.5 认为有效（1或2都有效）
                 tracking_rad_ = std::stod(rad_str);
                 tracking_dy_ = static_cast<int>(std::round(std::stof(dy_str)));
                 
-                RCLCPP_DEBUG(this->get_logger(), "颜色跟踪: valid=%d rad=%.3f dy=%d", 
-                            tracking_valid_, tracking_rad_, tracking_dy_);
+                // 根据状态值显示不同模式
+                const char* mode_name = (status > 1.5f) ? "黑色检测" : 
+                                       (status > 0.5f) ? "彩色跟踪" : "无效";
+                RCLCPP_DEBUG(this->get_logger(), "视觉[%s]: status=%.2f valid=%d rad=%.3f dy=%d", 
+                            mode_name, status, tracking_valid_, tracking_rad_, tracking_dy_);
             } catch (const std::exception& e) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                   "解析颜色跟踪数据失败: %s", e.what());
+                                   "解析视觉数据失败: %s", e.what());
                 tracking_valid_ = false;
+                tracking_status_ = 0.0f;
             }
         } else {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                               "颜色跟踪数据格式错误: %s", msg->data.c_str());
+                               "视觉数据格式错误: %s", msg->data.c_str());
             tracking_valid_ = false;
+            tracking_status_ = 0.0f;
         }
     }
     
@@ -226,11 +233,11 @@ private:
         OmniWheelCmd packet;
         packet.header = 0xA5;
         
-        // 颜色跟踪数据映射（匹配下位机 Vision_Info 读取）
+        // 视觉数据映射（匹配下位机 Vision_Info 读取）
         // 下位机: Vision_Info.dx = recv_data.x, dy = recv_data.y, flog = recv_data.z
         packet.x = static_cast<float>(tracking_rad_);   // dx - 角度 (rad)
         packet.y = static_cast<float>(tracking_dy_);    // dy - 垂直偏移 (pixels)
-        packet.z = tracking_valid_ ? 1.0f : 0.0f;       // flog - 有效标志
+        packet.z = tracking_status_;                    // flog - 状态标志 (0=无效 1=彩色 2=黑色)
         
         // 速度控制
         packet.vx = static_cast<float>(vx);
@@ -307,8 +314,9 @@ private:
     
     rclcpp::Time last_cmd_time_;
     
-    // 颜色跟踪数据
+    // 视觉跟踪数据
     bool tracking_valid_{false};
+    float tracking_status_{0.0f};  // 状态值: 0=无效 1=彩色跟踪 2=黑色检测
     double tracking_rad_{0.0};
     int tracking_dy_{0};
 };

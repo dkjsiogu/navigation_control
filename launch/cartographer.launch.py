@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
-SLAM Toolbox 纯定位模式启动文件
-================================
+Cartographer SLAM 建图模式启动文件
+功能:
+1. RPLIDAR驱动 + 扫描过滤
+2. 轮式里程计 (发布 /odom 和 TF: odom->base_link)
+3. Cartographer 实时建图 + 定位
+4. 串口通信 (全向轮控制)
+5. 完整导航功能
+6. RViz2可视化
 
-特性:
-1. 加载已保存的地图 (posegraph格式)
-2. 纯定位模式 (不建新图)
-3. 自动初始定位
-4. 稳定的扫描匹配
-5. 完整的导航功能
-
-TF树: map -> odom (SLAM Toolbox) -> base_link (轮式里程计) -> laser (URDF)
+TF树: map -> odom (Cartographer) -> base_link (wheel_odom) -> laser (URDF)
 
 使用方法:
-1. 先用SLAM Toolbox建图并保存为 .posegraph
-2. 将地图文件放在 maps/ 目录
-3. 启动: ros2 launch navigation_control slam_toolbox_localization.launch.py
+   ros2 launch navigation_control cartographer.launch.py
 """
 
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch.conditions import IfCondition
 import os
 from ament_index_python.packages import get_package_share_directory
 
@@ -32,19 +28,12 @@ def generate_launch_description():
     config_dir = os.path.join(nav_control_dir, 'config')
     maps_dir = os.path.join(nav_control_dir, 'maps')
     urdf_file = os.path.join(nav_control_dir, 'urdf', 'robot.urdf')
-    slam_toolbox_config = os.path.join(config_dir, 'slam_toolbox_localization.yaml')
     
     # 读取 URDF 文件
     with open(urdf_file, 'r') as f:
         robot_description = f.read()
     
     # 声明启动参数
-    map_yaml_arg = DeclareLaunchArgument(
-        'map_yaml',
-        default_value=os.path.join(maps_dir, 'my_slam_map.yaml'),
-        description='Path to map yaml file (pgm+yaml format)'
-    )
-    
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
         default_value='/dev/radar',
@@ -57,26 +46,9 @@ def generate_launch_description():
         description='Development board serial port'
     )
     
-    use_rviz_arg = DeclareLaunchArgument(
-        'use_rviz',
-        default_value='true',
-        description='Whether to start RViz2'
-    )
-    
-    use_icp_arg = DeclareLaunchArgument(
-        'use_icp',
-        default_value='true',
-        description='Whether to use ICP auto-relocalization'
-    )
-    
-
-    
     return LaunchDescription([
-        map_yaml_arg,
         lidar_port_arg,
         dev_board_port_arg,
-        use_rviz_arg,
-        use_icp_arg,
         
         # ============ 机器人模型发布 ============
         Node(
@@ -101,6 +73,7 @@ def generate_launch_description():
                 'base_frame': 'base_link',
                 'publish_tf': True,
                 'enable_crc_check': False,
+                'enable_slam_correction': False,  # ❌ Cartographer模式禁用：Cartographer内部已做传感器融合
             }],
         ),
         
@@ -134,85 +107,56 @@ def generate_launch_description():
                 'angle_compensate': True,
             }],
             remappings=[
-                ('/scan', '/scan_raw'),
+                ('/scan', '/scan_raw'),  # 发布到 /scan_raw
             ],
         ),
         
-        # ============ 激光扫描过滤器 ============
+        # ============ 激光扫描过滤器 (过滤机器人本体) ============
+        # 雷达倒装(X朝后Y朝右)，需过滤机器人后方本体
         Node(
             package='navigation_control',
             executable='scan_filter_node',
             name='scan_filter_node',
             output='screen',
             parameters=[{
-                'filter_angle_min': -2.30,
-                'filter_angle_max': 2.69,
-                'filter_range_max': 0.35,
+                'filter_angle_min': -2.30,  # -132° (左后角，雷达坐标系)
+                'filter_angle_max': 2.69,   # 154° (右后角，雷达坐标系)
+                'filter_range_max': 0.35,   # 只过滤 0.35m 以内
                 'input_topic': '/scan_raw',
-                'output_topic': '/scan',
+                'output_topic': '/scan',    # 输出到标准 /scan
             }],
         ),
         
-        # ============ 地图服务器 (加载pgm+yaml地图) ============
+        # ============ Cartographer SLAM 建图节点 ============
+        # 功能: 实时建图 + 定位
+        # 发布: map → odom TF
         Node(
-            package='nav2_map_server',
-            executable='map_server',
-            name='map_server',
-            output='screen',
-            parameters=[{
-                'yaml_filename': LaunchConfiguration('map_yaml'),
-                'use_sim_time': False,
-            }],
-        ),
-        
-        # ============ 生命周期管理器 ============
-        Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_localization',
+            package='cartographer_ros',
+            executable='cartographer_node',
+            name='cartographer_node',
             output='screen',
             parameters=[{
                 'use_sim_time': False,
-                'autostart': True,
-                'node_names': ['map_server'],
             }],
-        ),
-        
-        # ============ SLAM Toolbox 纯定位节点 (动态维护地图) ============
-        # 发布到 /slam_map: 基于静态地图进行闭环优化和动态更新
-        Node(
-            package='slam_toolbox',
-            executable='localization_slam_toolbox_node',
-            name='slam_toolbox',
-            output='screen',
-            parameters=[slam_toolbox_config],
+            arguments=[
+                '-configuration_directory', config_dir,
+                '-configuration_basename', 'cartographer.lua',
+            ],
             remappings=[
-                ('/map', '/slam_map'),  # 动态优化的地图发布到 /slam_map
+                ('/odom', '/odom'),  # 订阅轮式里程计数据（融合定位）
             ],
         ),
         
-        # ============ ICP 自动重定位节点 (可选) ============
+        # ============ Cartographer 占用栅格节点 (发布地图) ============
         Node(
-            package='navigation_control',
-            executable='icp_relocalization.py',
-            name='icp_relocalization',
+            package='cartographer_ros',
+            executable='cartographer_occupancy_grid_node',
+            name='occupancy_grid_node',
             output='screen',
             parameters=[{
-                'scan_topic': '/scan',
-                'map_topic': '/map_viz',
-                'max_iterations': 50,
-                'convergence_threshold': 0.001,
-                'max_correspondence_distance': 0.5,
-                'min_scan_points': 50,
-                'initial_x': 0.0,
-                'initial_y': 0.0,
-                'search_grid_size': 0.2,            # ±0.2m 范围（从2m减少）
-                'search_grid_resolution': 0.01,      # 1cm 精度（从1cm放大）
-                'angle_search_range': 0.1745,       # ±10° (从±5°增加)
-                'angle_search_step': 0.0872,        # 5° 步进（从1°放大）
-                'auto_relocalize_interval': 3.0
+                'use_sim_time': False,
+                'resolution': 0.05,
             }],
-            condition=IfCondition(LaunchConfiguration('use_icp'))
         ),
         
         # ============ 地图重发布节点 (解决 RViz2 QoS 问题) ============
@@ -248,46 +192,46 @@ def generate_launch_description():
             }],
         ),
         
-        # ============ A* 路径规划器 ============
+        # ============ A* 路径规划器 (矩形footprint + 障碍物距离代价) ============
         Node(
             package='navigation_control',
             executable='astar_planner.py',
             name='astar_planner',
             output='screen',
             parameters=[{
-                'robot_length': 0.262,
-                'robot_width': 0.270,
-                'safety_margin': 0.03,
-                'diagonal_penalty': 1.2,
-                'smoothing_iterations': 20,
-                'waypoint_spacing': 0.20,
+                'robot_length': 0.382,         # 机器人长度 (382mm URDF collision)
+                'robot_width': 0.340,          # 机器人宽度 (340mm URDF collision)
+                'safety_margin': 0.03,         # 安全裕量 (3cm)
+                'diagonal_penalty': 1.2,       # 对角线移动惩罚 (略微惩罚，允许圆弧)
+                'smoothing_iterations': 20,    # 增加平滑迭代，生成更圆润的圆弧
+                'waypoint_spacing': 0.20,      # 路径点间距 (20cm，保留转角点)
             }]
         ),
         
-        # ============ 路径跟踪控制器 ============
+        # ============ 路径跟踪控制器 (Pure Pursuit + 全向轮 - 8Hz雷达优化) ============
         Node(
             package='navigation_control',
             executable='simple_goal_controller.py',
             name='path_tracker',
             output='screen',
             parameters=[{
-                'max_linear_vel': 0.5,
-                'max_angular_vel': 0.3,
-                'goal_tolerance': 0.10,
-                'lookahead_distance': 0.5,
-                'waypoint_tolerance': 0.15,
+                'max_linear_vel': 0.3,         # 8Hz雷达最优巡航速度
+                'max_angular_vel': 0.5,        # ~30°/s，避免IMU积分误差
+                'goal_tolerance': 0.10,        # 到达目标容差 (10cm)
+                'lookahead_distance': 0.5,     # Pure Pursuit 前瞻距离
+                'waypoint_tolerance': 0.15,    # 路径点切换容差
             }]
         ),
         
-        # ============ 全向轮控制器 ============
+        # ============ 全向轮控制器 (cmd_vel -> 下位机协议) ============
         Node(
             package='navigation_control',
             executable='serial_data_publisher',
             name='serial_data_publisher',
             output='screen',
             parameters=[{
-                'max_vx': 1.0,
-                'max_vy': 1.0,
+                'max_vx': 0.3,
+                'max_vy': 0.3,
                 'max_wz': 2.0,
                 'velocity_timeout': 1.0,
                 'smooth_factor': 0.7,
@@ -301,22 +245,6 @@ def generate_launch_description():
             name='rviz2',
             output='screen',
             arguments=['-d', os.path.join(config_dir, 'navigation_debug.rviz')],
-            condition=IfCondition(LaunchConfiguration('use_rviz')),
-        ),
-        
-        # ============ 视觉任务调度器 ============
-        Node(
-            package='color_tracking_node',
-            executable='task_scheduler',
-            name='task_scheduler',
-            output='screen',
-        ),
-        
-        # ============ 颜色跟踪节点 (默认启动) ============
-        Node(
-            package='color_tracking_node',
-            executable='color_tracking_node',
-            name='color_tracking_node',
-            output='screen',
         ),
     ])
+

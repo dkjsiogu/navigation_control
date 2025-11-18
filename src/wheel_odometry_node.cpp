@@ -38,7 +38,10 @@
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <cstring>
 #include <cmath>
 
@@ -103,6 +106,8 @@ struct __attribute__((packed)) VisionSendPacket {
     float chassis_vx;            // ⚠️ 新增: 底盘实时速度X (m/s, 4字节)
     float chassis_vy;            // ⚠️ 新增: 底盘实时速度Y (m/s, 4字节)
     float chassis_w;             // ⚠️ 新增: 底盘角速度 (rad/s, 4字节)
+    double x;
+    double y;
     uint16_t game_time;          // 比赛时间 (s, 2字节)
     uint32_t timestamp;          // 时间戳 (ms, 4字节)
     uint16_t checksum;           // CRC16校验 (2字节)
@@ -130,6 +135,13 @@ public:
         this->declare_parameter("publish_tf", true);
         this->declare_parameter("enable_crc_check", true);
         this->declare_parameter("imu_drift_compensation_deg_per_min", 0.5);  // 每分钟补偿角度(度)
+        this->declare_parameter("enable_slam_correction", true);  // 是否启用SLAM校正
+        this->declare_parameter("slam_correction_interval", 3.0);  // SLAM校正间隔(秒) - 🔧 低频率避免噪声
+        this->declare_parameter("slam_correction_static_threshold", 0.02);  // 静止判定阈值(m/s) - 2cm/s
+        this->declare_parameter("slam_correction_moving_gain", 0.0);   // 运动时不校正
+        this->declare_parameter("slam_correction_static_gain", 0.0);   // 静止时也不校正(默认) - 完全信任里程计
+        this->declare_parameter("slam_correction_large_error_threshold", 0.30);  // 大误差阈值(m) - 30cm
+        this->declare_parameter("slam_correction_large_error_gain", 0.20);  // 大误差校正增益(20%) - 一次性修正
         
         odom_frame_ = this->get_parameter("odom_frame").as_string();
         base_frame_ = this->get_parameter("base_frame").as_string();
@@ -137,6 +149,13 @@ public:
         enable_crc_check_ = this->get_parameter("enable_crc_check").as_bool();
         imu_drift_compensation_rate_ = this->get_parameter("imu_drift_compensation_deg_per_min").as_double() 
                                        * (M_PI / 180.0) / 60.0;  // 转换为 rad/s
+        enable_slam_correction_ = this->get_parameter("enable_slam_correction").as_bool();
+        slam_correction_interval_ = this->get_parameter("slam_correction_interval").as_double();
+        slam_static_threshold_ = this->get_parameter("slam_correction_static_threshold").as_double();
+        slam_moving_gain_ = this->get_parameter("slam_correction_moving_gain").as_double();
+        slam_static_gain_ = this->get_parameter("slam_correction_static_gain").as_double();
+        slam_large_error_threshold_ = this->get_parameter("slam_correction_large_error_threshold").as_double();
+        slam_large_error_gain_ = this->get_parameter("slam_correction_large_error_gain").as_double();
         
         // 订阅串口接收数据
         serial_rx_sub_ = this->create_subscription<std_msgs::msg::UInt8MultiArray>(
@@ -153,6 +172,17 @@ public:
         // TF广播器
         if (publish_tf_) {
             tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+        }
+        
+        // TF监听器 - 用于获取SLAM校正
+        if (enable_slam_correction_) {
+            tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+            
+            // 定时器 - 定期从SLAM获取校正
+            slam_correction_timer_ = this->create_wall_timer(
+                std::chrono::duration<double>(slam_correction_interval_),
+                std::bind(&WheelOdometryNode::correctFromSlam, this));
         }
         
         // 服务 - 重置里程计
@@ -177,6 +207,12 @@ public:
         RCLCPP_INFO(this->get_logger(), "Base frame: %s", base_frame_.c_str());
         RCLCPP_INFO(this->get_logger(), "Publish TF: %s", publish_tf_ ? "YES" : "NO");
         RCLCPP_INFO(this->get_logger(), "CRC Check: %s", enable_crc_check_ ? "ENABLED" : "DISABLED");
+        RCLCPP_INFO(this->get_logger(), "SLAM Correction: %s (%.2fs interval)", 
+                    enable_slam_correction_ ? "ENABLED" : "DISABLED", slam_correction_interval_);
+        if (enable_slam_correction_) {
+            RCLCPP_INFO(this->get_logger(), "  └─ 静止阈值: %.2fm/s | 运动增益: %.1f%% | 静止增益: %.1f%%",
+                       slam_static_threshold_, slam_moving_gain_*100, slam_static_gain_*100);
+        }
         RCLCPP_INFO(this->get_logger(), "IMU Drift Compensation: %.2f°/min (%.6f rad/s)", 
                    imu_drift_compensation_rate_ * 60.0 * 180.0 / M_PI, imu_drift_compensation_rate_);
         RCLCPP_INFO(this->get_logger(), "===================================");
@@ -222,16 +258,23 @@ private:
     // 处理里程计增量数据
     void processOdometryDelta(const VisionSendPacket& packet)
     {
-        // ===== 架构变更：现在使用实时速度积分，而非预积分位移 =====
-        // 使用 chassis_vx/vy/w (机器人坐标系速度) + ROS时间戳计算dt
+        // ===== 新架构：下位机1ms定时器累加位移，上位机计算差值 =====
+        // packet.x/y: 下位机累积的位移 (m, 机器人坐标系)
+        // packet.chassis_vx/vy: 实时速度 (m/s, 用于验证对比)
         
-        // 1. 计算时间增量 (使用ROS时间，忽略下位机timestamp)
+        // 1. 计算时间增量 (使用ROS时间)
         rclcpp::Time current_time = this->now();
         
         if (!last_update_time_.nanoseconds()) {
-            // 第一帧：只初始化时间，不积分
+            // 第一帧：只初始化时间和下位机位移基准，不积分
             last_update_time_ = current_time;
-            RCLCPP_INFO(this->get_logger(), "里程计初始化：等待下一帧开始积分");
+            last_board_x_ = packet.x;
+            last_board_y_ = packet.y;
+            last_board_pos_valid_ = true;
+            RCLCPP_INFO(this->get_logger(), "里程计初始化：下位机位移基准 (%.6f, %.6f)", 
+                       packet.x, packet.y);
+            RCLCPP_INFO(this->get_logger(), "  速度: vx=%.6f vy=%.6f w=%.6f",
+                       packet.chassis_vx, packet.chassis_vy, packet.chassis_w);
             return;
         }
         
@@ -250,27 +293,85 @@ private:
         
         if (dt > MAX_DT) {
             RCLCPP_WARN(this->get_logger(), 
-                       "dt过大 (%.3fs)，可能丢包/暂停，重置时间基准", dt);
-            // 不积分，只更新时间（已在上面更新）
+                       "dt过大 (%.3fs)，可能丢包/暂停，重置基准", dt);
+            // 重置下位机位移基准
+            last_board_x_ = packet.x;
+            last_board_y_ = packet.y;
+            last_board_pos_valid_ = true;
             return;
         }
         
-        // 3. 读取机器人坐标系速度（下位机发送的实时值）
-        float vx_robot = packet.chassis_vx;  // 前进速度 (m/s)
-        float vy_robot = packet.chassis_vy;  // 左侧速度 (m/s)
-        float wz = packet.chassis_w;         // 角速度 (rad/s)
+        // 3. 计算下位机位移增量（机器人坐标系）
+        if (!last_board_pos_valid_) {
+            last_board_x_ = packet.x;
+            last_board_y_ = packet.y;
+            last_board_pos_valid_ = true;
+            return;
+        }
         
-        // 3.5 读取IMU yaw角（用于后面计算变化量）
+        double dx_robot = packet.x - last_board_x_;
+        double dy_robot = packet.y - last_board_y_;
+        
+        // 📊 增强诊断: 打印下位机速度 vs 累积位移的关系
+        static int raw_data_counter = 0;
+        if (++raw_data_counter >= 10) {
+            raw_data_counter = 0;
+            
+            // 计算理论位移(速度积分)
+            double expected_dx = packet.chassis_vx * dt;
+            double expected_dy = packet.chassis_vy * dt;
+            double expected_disp = std::sqrt(expected_dx*expected_dx + expected_dy*expected_dy);
+            double actual_disp = std::sqrt(dx_robot*dx_robot + dy_robot*dy_robot);
+            
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[诊断] dt=%.3fs | 下位机累积Δ: (%.1f,%.1f)mm 共%.1fmm | "
+            //     "速度: vx=%.3f vy=%.3f w=%.3f | 速度积分预期: %.1fmm | 差异: %.1fmm",
+            //     dt, dx_robot*1000, dy_robot*1000, actual_disp*1000,
+            //     packet.chassis_vx, packet.chassis_vy, packet.chassis_w,
+            //     expected_disp*1000, (actual_disp - expected_disp)*1000);
+        }
+        
+        // ⚠️ 检测下位机累积值异常跳变（重置/溢出）
+        double displacement_magnitude = std::sqrt(dx_robot*dx_robot + dy_robot*dy_robot);
+        const double MAX_REASONABLE_DISPLACEMENT = 0.5;  // 0.5m (以dt=0.1s, vmax=0.3m/s, 安全系数10倍)
+        
+        if (displacement_magnitude > MAX_REASONABLE_DISPLACEMENT) {
+            RCLCPP_WARN(this->get_logger(),
+                "⚠️ 下位机累积值异常跳变: 增量=%.3fm (%.1fcm) | 上次:(%.3f,%.3f) 当前:(%.3f,%.3f) | 重置基准",
+                displacement_magnitude, displacement_magnitude*100,
+                last_board_x_, last_board_y_, packet.x, packet.y);
+            
+            // 重置基准,丢弃本帧增量
+            last_board_x_ = packet.x;
+            last_board_y_ = packet.y;
+            
+            // 保持当前累积位置不变,避免大跳变
+            publishDebugData(packet, 0.0, 0.0, 0.0, dt, true, false, false);
+            publishOdometry();
+            if (publish_tf_) publishTransform();
+            return;
+        }
+        
+        // 更新下位机位移历史(必须更新以保持差分基准同步)
+        last_board_x_ = packet.x;
+        last_board_y_ = packet.y;
+        
+        // 4. 读取下位机实时速度（用于对比验证）
+        float vx_board = packet.chassis_vx;
+        float vy_board = packet.chassis_vy;
+        float wz = packet.chassis_w;
+        
+        // 5. 读取IMU yaw角（用于坐标转换和纯旋转判断）
         double imu_yaw = packet.yaw;  // IMU航向角 (rad)
         
-        // 3.6 应用IMU漂移补偿（基于运行时间累积）
+        // 6. 应用IMU漂移补偿（基于运行时间累积）
         double elapsed_time = (current_time - imu_compensation_start_time_).seconds();
-        double drift_compensation = elapsed_time * imu_drift_compensation_rate_;  // 累计补偿量 (rad)
-        imu_yaw += drift_compensation;  // 应用补偿
+        double drift_compensation = elapsed_time * imu_drift_compensation_rate_;
+        imu_yaw += drift_compensation;
         
         // 每60秒输出一次补偿信息
         static int compensation_log_counter = 0;
-        if (++compensation_log_counter >= 600) {  // 假设数据包频率~10Hz，600次≈60秒
+        if (++compensation_log_counter >= 600) {
             compensation_log_counter = 0;
             RCLCPP_INFO(this->get_logger(), 
                        "[IMU补偿] 运行时间: %.1fs | 累计补偿: %.2f° | 原始yaw: %.2f° | 补偿后yaw: %.2f°",
@@ -278,112 +379,160 @@ private:
                        packet.yaw * 180.0 / M_PI, imu_yaw * 180.0 / M_PI);
         }
         
-        // 4. 速度死区过滤（过滤编码器噪声）
-        const double VEL_THRESHOLD = 0.001;    // 1mm/s
-        const double ANGULAR_THRESHOLD = 0.001; // ~0.06°/s
+        // 更新IMU yaw历史（用于计算角速度）
+        double delta_yaw = 0.0;
+        double actual_wz = 0.0;  // 实际角速度(从IMU计算)
         
-        if (std::abs(vx_robot) < VEL_THRESHOLD) vx_robot = 0.0f;
-        if (std::abs(vy_robot) < VEL_THRESHOLD) vy_robot = 0.0f;
-        if (std::abs(wz) < ANGULAR_THRESHOLD) wz = 0.0f;
+        if (last_imu_yaw_valid_) {
+            delta_yaw = imu_yaw - last_imu_yaw_;
+            // 角度归一化
+            while (delta_yaw > M_PI) delta_yaw -= 2.0 * M_PI;
+            while (delta_yaw < -M_PI) delta_yaw += 2.0 * M_PI;
+            
+            // 从IMU yaw变化量计算实际角速度
+            actual_wz = delta_yaw / dt;
+        }
         
-        // 5. 计算综合运动大小（用于静止判断）
-        double translation_speed = std::sqrt(vx_robot*vx_robot + vy_robot*vy_robot);
-        double rotation_speed = std::abs(wz) * 0.15;  // 乘以特征半径转为线速度等效
+        last_imu_yaw_ = imu_yaw;
+        last_imu_yaw_valid_ = true;
+        
+        // 7. ⚠️ 全向轮特性: 旋转与平移解耦
+        // 全向轮可以全向移动,不需要通过旋转来改变移动方向
+        // 旋转只是调整工作姿态,假设旋转时不产生xy位移
+        // 简化策略: 只要IMU yaw有变化(>0.3°),就清零xy位移
+        
+        const double ROTATION_THRESHOLD = 0.005;  // 0.005 rad ≈ 0.3°
+        bool is_pure_rotation = std::abs(delta_yaw) > ROTATION_THRESHOLD;
+        
+        if (is_pure_rotation) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "🔄 旋转中: Δyaw=%.2f° → 清零xy位移(原%.1fmm)",
+                delta_yaw * 180.0 / M_PI, 
+                std::sqrt(dx_robot*dx_robot + dy_robot*dy_robot)*1000);
+            dx_robot = 0.0;
+            dy_robot = 0.0;
+        }
+        
+        // 8. 位移死区过滤（过滤噪声,但仅用于非旋转时）
+        if (!is_pure_rotation) {
+            const double DISP_THRESHOLD = 0.0001;    // 0.1mm
+            if (std::abs(dx_robot) < DISP_THRESHOLD) dx_robot = 0.0;
+            if (std::abs(dy_robot) < DISP_THRESHOLD) dy_robot = 0.0;
+        }
+        
+        // 角速度死区过滤(避免静止时的IMU噪声)
+        const double ANGULAR_NOISE_THRESHOLD = 0.015;  // ~0.86°/s 用于过滤IMU噪声
+        if (!is_pure_rotation && std::abs(wz) < ANGULAR_NOISE_THRESHOLD) {
+            wz = 0.0;
+        }
+        
+        // 9. 上位机速度积分模式（旧方法，用于对比）
+        double vel_dx_robot = vx_board * dt;
+        double vel_dy_robot = vy_board * dt;
+        double cos_theta_for_vel = std::cos(velocity_integrated_theta_);
+        double sin_theta_for_vel = std::sin(velocity_integrated_theta_);
+        double vel_dx_world = vel_dx_robot * cos_theta_for_vel - vel_dy_robot * sin_theta_for_vel;
+        double vel_dy_world = vel_dx_robot * sin_theta_for_vel + vel_dy_robot * cos_theta_for_vel;
+        velocity_integrated_x_ += vel_dx_world;
+        velocity_integrated_y_ += vel_dy_world;
+        
+        // 10. 计算综合运动大小（用于静止判断）
+        double translation_speed = std::sqrt(dx_robot*dx_robot + dy_robot*dy_robot) / dt;
+        double rotation_speed = std::abs(wz) * 0.15;
         double total_motion_speed = translation_speed + rotation_speed;
         
-        const double MOTION_THRESHOLD = 0.002; // 2mm/s 综合运动阈值
+        const double MOTION_THRESHOLD = 0.015; // 15mm/s
         
         if (total_motion_speed < MOTION_THRESHOLD) {
-            // 静止：速度指数衰减而非突变为0
-            current_vx_ *= 0.7;
-            current_vy_ *= 0.7;
-            current_wz_ *= 0.7;
+            // 静止：清零速度
+            current_vx_ = 0.0;
+            current_vy_ = 0.0;
+            current_wz_ = 0.0;
+            current_vx_robot_ = 0.0;
+            current_vy_robot_ = 0.0;
+            current_wz_robot_ = 0.0;
             
-            // ⚠️ 静止时冻结IMU Yaw更新（防止陀螺仪漂移累积）
-            // 更新 last_imu_yaw_ 为当前值，但不累积到 current_theta_
-            // 这样下次运动时 delta_yaw 会从当前IMU值开始计算，自动同步
+            // ⚠️ 静止时也要更新角度(可能在原地旋转但速度很慢)
+            if (std::abs(delta_yaw) > 0.001) {  // yaw变化 > 0.06°
+                current_theta_ += delta_yaw;
+                current_theta_ = std::atan2(std::sin(current_theta_), std::cos(current_theta_));
+                RCLCPP_DEBUG(this->get_logger(), "静止但在旋转: Δyaw=%.2f°", delta_yaw * 180.0 / M_PI);
+            }
+            
+            // 更新IMU yaw历史
             last_imu_yaw_ = imu_yaw;
             last_imu_yaw_valid_ = true;
             
-            publishDebugData(packet, 0.0, 0.0, 0.0, dt, true, false, false);
+            publishDebugData(packet, 0.0, 0.0, delta_yaw, dt, true, false, false);
             publishOdometry();
             if (publish_tf_) publishTransform();
             return;
         }
         
-        // 6. 判断是否为纯旋转（yaw有变化但xy不应累积）
-        const double PURE_ROTATION_VEL_THRESHOLD = 0.02;  // 2cm/s 平移速度阈值
-        const double PURE_ROTATION_ANGULAR_THRESHOLD = 0.05;  // ~2.9°/s 角速度阈值
+        // 11. ⚠️ 先更新角度,再用新角度转换位移
+        // 使用步骤7已经计算好的 delta_yaw (从IMU yaw变化量)
+        current_theta_ += delta_yaw;
+        current_theta_ = std::atan2(std::sin(current_theta_), std::cos(current_theta_));
         
-        // 使用之前计算的 translation_speed（避免重复定义）
-        bool is_pure_rotation = (std::abs(wz) > PURE_ROTATION_ANGULAR_THRESHOLD) && 
-                                (translation_speed < PURE_ROTATION_VEL_THRESHOLD);
-        
-        // 7. 机器人坐标系速度 -> 位移增量（简单矩形积分）
-        double dx_robot = is_pure_rotation ? 0.0 : vx_robot * dt;  // 纯旋转时不累积xy
-        double dy_robot = is_pure_rotation ? 0.0 : vy_robot * dt;  // 纯旋转时不累积xy
-        
-        // 8. 转换到世界坐标系（使用当前角度）
+        // 13. ⚠️ 关键: 使用**更新后的current_theta_**转换下位机位移到世界坐标系
+        // 下位机的dx/dy是在机器人坐标系,需要用此刻的朝向(current_theta_)转换
         double cos_theta = std::cos(current_theta_);
         double sin_theta = std::sin(current_theta_);
         
         double dx_world = dx_robot * cos_theta - dy_robot * sin_theta;
         double dy_world = dx_robot * sin_theta + dy_robot * cos_theta;
         
-        // 9. 累加位姿
+        // 14. 累加位姿
         current_x_ += dx_world;
         current_y_ += dy_world;
         
-        // ⚠️ 使用IMU Yaw的变化量来更新累积角度（而非编码器角速度积分），IMU旋转测量更准确
-        double delta_yaw_for_pose = 0.0;
-        if (last_imu_yaw_valid_) {
-            // 计算IMU yaw变化量（处理跨越±π的情况）
-            delta_yaw_for_pose = imu_yaw - last_imu_yaw_;
-            
-            // 角度归一化到 [-π, π]
-            while (delta_yaw_for_pose > M_PI) delta_yaw_for_pose -= 2.0 * M_PI;
-            while (delta_yaw_for_pose < -M_PI) delta_yaw_for_pose += 2.0 * M_PI;
-            
-            // 累加角度变化量（而非直接用IMU Yaw绝对值，因为IMU初始角度可能不是0）
-            current_theta_ += delta_yaw_for_pose;
-            
-            // 角度归一化到 [-π, π]
-            current_theta_ = std::atan2(std::sin(current_theta_), std::cos(current_theta_));
-        }
+        // 速度积分模式：同样使用IMU角度更新
+        velocity_integrated_theta_ += delta_yaw;
+        velocity_integrated_theta_ = std::atan2(std::sin(velocity_integrated_theta_), std::cos(velocity_integrated_theta_));
         
-        // 更新IMU yaw历史（为下一帧计算变化量做准备）
-        last_imu_yaw_ = imu_yaw;
-        last_imu_yaw_valid_ = true;
+        // 📊 定期对比两种积分方式的累积误差
+        double position_diff_x = current_x_ - velocity_integrated_x_;
+        double position_diff_y = current_y_ - velocity_integrated_y_;
+        double position_diff_dist = std::sqrt(position_diff_x*position_diff_x + position_diff_y*position_diff_y);
+        double theta_diff = (current_theta_ - velocity_integrated_theta_) * 180.0 / M_PI;
         
-        // 10. 更新速度
-        // 世界坐标系速度（用于调试显示）
+        static int compare_log_counter = 0;
+        // if (++compare_log_counter >= 50) {  // 每50帧打印一次
+        //     compare_log_counter = 0;
+        //     RCLCPP_INFO(this->get_logger(),
+        //         "[双模式对比] 差分位置:(%.3f, %.3f, %.1f°) | 速度积分:(%.3f, %.3f, %.1f°) | 误差:%.1fmm %.1f°",
+        //         current_x_, current_y_, current_theta_*180.0/M_PI,
+        //         velocity_integrated_x_, velocity_integrated_y_, velocity_integrated_theta_*180.0/M_PI,
+        //         position_diff_dist*1000, theta_diff);
+        // }
+        
+        // 15. 更新速度
         current_vx_ = dx_world / dt;
         current_vy_ = dy_world / dt;
-        current_wz_ = delta_yaw_for_pose / dt;  // 使用IMU yaw变化量计算角速度
+        current_wz_ = actual_wz;  // 使用IMU计算的角速度
         
         // 机器人坐标系速度（用于发布Odometry消息）
-        current_vx_robot_ = vx_robot;
-        current_vy_robot_ = vy_robot;
+        current_vx_robot_ = vx_board;
+        current_vy_robot_ = vy_board;
         current_wz_robot_ = wz;
         
-        // 11. 发布调试数据
-        publishDebugData(packet, dx_world, dy_world, delta_yaw_for_pose, dt, false, is_pure_rotation, true);
+        // 16. 发布调试数据
+        publishDebugData(packet, dx_world, dy_world, delta_yaw, dt, false, is_pure_rotation, true);
         
-        // 12. 发布里程计消息
+        // 17. 发布里程计消息
         publishOdometry();
         
-        // 13. 发布TF变换
+        // 18. 发布TF变换
         if (publish_tf_) {
             publishTransform();
         }
         
-        // 调试日志（详细版）
+        // 调试日志
         RCLCPP_DEBUG(this->get_logger(), 
-                    "速度: vx=%.3f vy=%.3f w=%.3f | dt=%.4fs | "
-                    "增量: dx=%.4f dy=%.4f dθ=%.4f(IMU)%s | "
-                    "位姿: x=%.3f y=%.3f θ=%.3f",
-                    vx_robot, vy_robot, wz, dt,
-                    dx_world, dy_world, delta_yaw_for_pose, is_pure_rotation ? " [纯旋转-不累积XY]" : "",
+                    "下位机累积: (%.4f,%.4f) | 增量: dx=%.4f dy=%.4f | IMU方向转换 | "
+                    "dt=%.4fs | dθ=%.4f%s | 位姿: x=%.3f y=%.3f θ=%.3f",
+                    packet.x, packet.y, dx_robot, dy_robot, dt,
+                    delta_yaw, is_pure_rotation ? " [纯旋转]" : "",
                     current_x_, current_y_, current_theta_);
     }
     
@@ -423,7 +572,7 @@ private:
         odom_msg.header.frame_id = odom_frame_;
         odom_msg.child_frame_id = base_frame_;
         
-        // 位置
+        // 位置 = 当前累积位置
         odom_msg.pose.pose.position.x = current_x_;
         odom_msg.pose.pose.position.y = current_y_;
         odom_msg.pose.pose.position.z = 0.0;
@@ -466,7 +615,7 @@ private:
         odom_pub_->publish(odom_msg);
     }
     
-    // 发布TF变换
+    // 发布TF变换 odom → base_link
     void publishTransform()
     {
         geometry_msgs::msg::TransformStamped t;
@@ -488,6 +637,86 @@ private:
         tf_broadcaster_->sendTransform(t);
     }
     
+    // 从SLAM获取校正并直接修改里程计位姿
+    void correctFromSlam()
+    {
+        if (!enable_slam_correction_) return;
+        
+        try {
+            // 获取 map -> base_link 的变换（SLAM校正后的真实位姿）
+            geometry_msgs::msg::TransformStamped map_to_base;
+            map_to_base = tf_buffer_->lookupTransform(
+                "map", base_frame_, tf2::TimePointZero);
+            
+            // 提取位置和角度
+            double slam_x = map_to_base.transform.translation.x;
+            double slam_y = map_to_base.transform.translation.y;
+            
+            tf2::Quaternion q(
+                map_to_base.transform.rotation.x,
+                map_to_base.transform.rotation.y,
+                map_to_base.transform.rotation.z,
+                map_to_base.transform.rotation.w);
+            double roll, pitch, slam_theta;
+            tf2::Matrix3x3(q).getRPY(roll, pitch, slam_theta);
+            
+            // 计算误差
+            double error_x = slam_x - current_x_;
+            double error_y = slam_y - current_y_;
+            double error_theta = slam_theta - current_theta_;
+            
+            // 角度归一化
+            while (error_theta > M_PI) error_theta -= 2.0 * M_PI;
+            while (error_theta < -M_PI) error_theta += 2.0 * M_PI;
+            
+            double error_dist = std::sqrt(error_x * error_x + error_y * error_y);
+            double error_angle_deg = std::abs(error_theta * 180.0 / M_PI);
+            
+            // 根据运动状态动态调整校正增益
+            double current_speed = std::sqrt(current_vx_*current_vx_ + current_vy_*current_vy_);
+            double correction_gain;
+            const char* mode_str;
+            
+            if (current_speed < slam_static_threshold_) {
+                // 静止状态: 默认不校正，信任里程计位置
+                // 只有误差较大时才进行一次性校正，避免SLAM噪声引起的位置漂移
+                if (error_dist < slam_large_error_threshold_) {
+                    RCLCPP_DEBUG(this->get_logger(), "静止且误差小(<%.0fcm),完全信任里程计", slam_large_error_threshold_*100);
+                    return;  // 误差小就不动
+                }
+                
+                // 误差较大，进行一次性中等强度校正
+                correction_gain = slam_large_error_gain_;
+                mode_str = "静止[大误差]";
+            } else {
+                // 运动状态: 跳过校正，信任高频里程计
+                RCLCPP_DEBUG(this->get_logger(), "运动中,跳过SLAM校正 (信任里程计)");
+                return;
+            }
+            
+            // 只要有误差就持续校正
+            if (error_dist > 0.001 || error_angle_deg > 0.1) {
+                // 直接修改里程计位置(⚠️ 会重置下位机差分基准!)
+                current_x_ += error_x * correction_gain;
+                current_y_ += error_y * correction_gain;
+                current_theta_ += error_theta * correction_gain;
+                
+                // 角度归一化
+                current_theta_ = std::atan2(std::sin(current_theta_), std::cos(current_theta_));
+                
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "🔄 SLAM校正[%s] 速度:%.2fm/s | 误差:%.1fcm/%.1f° | 增益:%.0f%% → 校正量:%.1fcm/%.1f°",
+                    mode_str, current_speed,
+                    error_dist * 100, error_angle_deg,
+                    correction_gain * 100,
+                    error_dist * correction_gain * 100, error_angle_deg * correction_gain);
+            }
+            
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_DEBUG(this->get_logger(), "无法获取SLAM校正: %s", ex.what());
+        }
+    }
+    
     // 重置里程计
     void resetOdometry()
     {
@@ -497,6 +726,9 @@ private:
         current_vx_ = 0.0;
         current_vy_ = 0.0;
         current_wz_ = 0.0;
+        velocity_integrated_x_ = 0.0;
+        velocity_integrated_y_ = 0.0;
+        velocity_integrated_theta_ = 0.0;
         
         RCLCPP_INFO(this->get_logger(), "里程计已重置");
     }
@@ -525,8 +757,11 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr odom_data_pub_;  // 调试用
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     rclcpp::Service<std_srvs::srv::Empty>::SharedPtr reset_odom_srv_;
     rclcpp::TimerBase::SharedPtr stats_timer_;
+    rclcpp::TimerBase::SharedPtr slam_correction_timer_;
     
     // 参数
     std::string odom_frame_;
@@ -534,6 +769,13 @@ private:
     bool publish_tf_;
     bool enable_crc_check_;
     double imu_drift_compensation_rate_;  // IMU漂移补偿速率 (rad/s)
+    bool enable_slam_correction_;         // 是否启用SLAM校正
+    double slam_correction_interval_;     // SLAM校正间隔 (s)
+    double slam_static_threshold_;        // 静止判定阈值 (m/s)
+    double slam_moving_gain_;             // 运动时校正增益 (0-1)
+    double slam_static_gain_;             // 静止时校正增益 (0-1)
+    double slam_large_error_threshold_;   // 大误差阈值 (m) - 触发强校正
+    double slam_large_error_gain_;        // 大误差校正增益 (0-1)
     rclcpp::Time imu_compensation_start_time_{0, 0, RCL_ROS_TIME};  // 补偿计时起点
     
     // 当前位姿 (世界坐标系 - odom frame)
@@ -557,6 +799,16 @@ private:
     // IMU yaw角历史（用于计算角速度）
     double last_imu_yaw_{0.0};
     bool last_imu_yaw_valid_{false};
+    
+    // 下位机累积位移历史（用于计算增量）
+    double last_board_x_{0.0};
+    double last_board_y_{0.0};
+    bool last_board_pos_valid_{false};
+    
+    // 速度积分累积位置（用于对比验证）
+    double velocity_integrated_x_{0.0};
+    double velocity_integrated_y_{0.0};
+    double velocity_integrated_theta_{0.0};
     
     // 统计
     long packets_received_{0};

@@ -9,9 +9,11 @@
 4. 监控导航状态
 
 任务类型:
-- goto: 前往航点
-- rotate: 原地旋转到指定角度
+- goto: 前往航点（包含位置和朝向）
 - wait: 等待指定时间
+- start_vision: 启动视觉任务（使用当前模式）
+- stop_vision: 停止视觉任务
+- set_vision_mode: 切换视觉任务模式（color_tracking 或 basket_detection）
 - sequence: 执行航点序列
 
 使用:
@@ -34,11 +36,16 @@ from enum import Enum
 
 class TaskType(Enum):
     GOTO = 'goto'
-    ROTATE = 'rotate'
     WAIT = 'wait'
     START_VISION = 'start_vision'
     STOP_VISION = 'stop_vision'
+    SET_VISION_MODE = 'set_vision_mode'
     SEQUENCE = 'sequence'
+
+class VisionMode(Enum):
+    DISABLED = 0  # 视觉关闭
+    COLOR_TRACKING = 1  # 颜色跟踪任务（默认）
+    BASKET_DETECTION = 2  # 放置框识别任务
 
 class MissionState(Enum):
     IDLE = 'idle'
@@ -122,11 +129,13 @@ class MissionController(Node):
         self.task_start_time = None
         self.target_yaw = None
         self.last_goal_pose = None
+        self.vision_mode = VisionMode.COLOR_TRACKING  # 默认颜色跟踪模式
         
         self.get_logger().info('🤖 任务控制器已启动')
         self.get_logger().info(f'   航点文件: {self.waypoints_file}')
         self.get_logger().info(f'   任务文件: {self.missions_file}')
         self.get_logger().info(f'   已加载任务: {len(self.missions)} 个')
+        self.get_logger().info(f'   视觉模式: 颜色跟踪（默认）')
         self.get_logger().info('')
         self.get_logger().info('📌 服务列表:')
         self.get_logger().info('   /mission/execute - 执行任务')
@@ -181,9 +190,9 @@ class MissionController(Node):
                     'description': '巡逻路线',
                     'tasks': [
                         {'type': 'goto', 'waypoint': 'point1'},
-                        {'type': 'rotate', 'yaw': 3.14},  # 转180度
                         {'type': 'wait', 'duration': 2.0},
                         {'type': 'goto', 'waypoint': 'point2'},
+                        {'type': 'wait', 'duration': 2.0},
                     ]
                 }
             }
@@ -353,13 +362,6 @@ class MissionController(Node):
                 self.task_start_time = None
                 self._last_logged_task = None
         
-        elif task_type == 'rotate':
-            if self.execute_rotate_task(task):
-                self.get_logger().info(f'✅ 任务 {self.current_task_index + 1} 完成，进入下一步')
-                self.current_task_index += 1
-                self.task_start_time = None
-                self._last_logged_task = None
-        
         elif task_type == 'wait':
             if self.execute_wait_task(task):
                 self.get_logger().info(f'✅ 任务 {self.current_task_index + 1} 完成，进入下一步')
@@ -378,9 +380,15 @@ class MissionController(Node):
                 self.get_logger().info(f'✅ 任务 {self.current_task_index + 1} 完成，进入下一步')
                 self.current_task_index += 1
                 self._last_logged_task = None
+        
+        elif task_type == 'set_vision_mode':
+            if self.execute_set_vision_mode_task(task):
+                self.get_logger().info(f'✅ 任务 {self.current_task_index + 1} 完成，进入下一步')
+                self.current_task_index += 1
+                self._last_logged_task = None
     
     def execute_goto_task(self, task):
-        """执行前往航点任务"""
+        """执行前往航点任务（包含位置和朝向）"""
         waypoint_name = task.get('waypoint')
         
         if waypoint_name not in self.waypoints:
@@ -390,7 +398,7 @@ class MissionController(Node):
         
         wp = self.waypoints[waypoint_name]
         
-        # 第一次执行，发送目标
+        # 第一次执行，发送完整的目标位姿（包含位置和朝向）
         if self.last_goal_pose != waypoint_name:
             goal = PoseStamped()
             goal.header.frame_id = 'map'
@@ -399,52 +407,23 @@ class MissionController(Node):
             goal.pose.position.y = wp['y']
             goal.pose.position.z = 0.0
             
+            # 设置目标朝向（航点定义的yaw角度）
             yaw = wp['yaw']
             goal.pose.orientation.w = math.cos(yaw / 2.0)
             goal.pose.orientation.z = math.sin(yaw / 2.0)
             
             self.goal_pub.publish(goal)
             self.last_goal_pose = waypoint_name
-            self.goal_reached = False  # 重置目标到达标志
-            self.get_logger().info(f'🎯 前往航点: {waypoint_name}')
+            self.goal_reached = False
+            self.get_logger().info(f'🎯 前往航点: {waypoint_name} (x={wp["x"]:.2f}, y={wp["y"]:.2f}, yaw={math.degrees(yaw):.1f}°)')
             return False
         
-        # 检查是否收到到达信号
+        # 检查是否收到到达信号（位置+朝向都到达）
         if self.goal_reached:
             self.get_logger().info(f'✅ 到达航点: {waypoint_name}')
             self.last_goal_pose = None
             self.goal_reached = False
             return True
-        
-        return False
-    
-    def execute_rotate_task(self, task):
-        """执行原地旋转任务"""
-        target_yaw = task.get('yaw', 0.0)
-        
-        if self.task_start_time is None:
-            self.task_start_time = time.time()
-            self.target_yaw = target_yaw
-            self.get_logger().info(f'🔄 旋转到: {math.degrees(target_yaw):.1f}°')
-        
-        current_yaw = self.get_current_yaw()
-        if current_yaw is None:
-            return False
-        
-        # 计算角度差
-        angle_diff = self.normalize_angle(target_yaw - current_yaw)
-        
-        if abs(angle_diff) < self.rotation_tolerance:
-            # 到达目标角度
-            stop_cmd = Twist()
-            self.cmd_vel_pub.publish(stop_cmd)
-            self.get_logger().info('✅ 旋转完成')
-            return True
-        
-        # 发送旋转指令
-        cmd = Twist()
-        cmd.angular.z = 0.5 if angle_diff > 0 else -0.5
-        self.cmd_vel_pub.publish(cmd)
         
         return False
     
@@ -463,14 +442,14 @@ class MissionController(Node):
         return False
     
     def execute_start_vision_task(self, task):
-        """启动视觉任务"""
-        task_id = task.get('task_id', 1)
-        
+        """启动视觉任务（使用当前模式）"""
+        # 使用当前视觉模式
         msg = Int32()
-        msg.data = task_id
+        msg.data = self.vision_mode.value
         self.task_command_pub.publish(msg)
         
-        self.get_logger().info(f'🎥 启动视觉任务: {task_id}')
+        mode_name = '颜色跟踪' if self.vision_mode == VisionMode.COLOR_TRACKING else '放置框识别'
+        self.get_logger().info(f'🎥 启动视觉任务: {mode_name} (命令={self.vision_mode.value})')
         return True
     
     def execute_stop_vision_task(self, task):
@@ -480,6 +459,34 @@ class MissionController(Node):
         self.task_command_pub.publish(msg)
         
         self.get_logger().info('🛑 停止视觉任务')
+        return True
+    
+    def execute_set_vision_mode_task(self, task):
+        """切换视觉任务模式（直接发送命令切换）"""
+        mode = task.get('mode', 'color_tracking')
+        
+        # 直接发送对应模式的命令，task_scheduler会处理停止和启动
+        if mode == 'color_tracking':
+            self.vision_mode = VisionMode.COLOR_TRACKING
+            msg = Int32()
+            msg.data = 1
+            self.task_command_pub.publish(msg)
+            self.get_logger().info('🔄 切换到颜色跟踪模式')
+        elif mode == 'basket_detection':
+            self.vision_mode = VisionMode.BASKET_DETECTION
+            msg = Int32()
+            msg.data = 2
+            self.task_command_pub.publish(msg)
+            self.get_logger().info('🔄 切换到放置框识别模式')
+        elif mode == 'stop' or mode == 'disabled':
+            self.vision_mode = VisionMode.DISABLED
+            msg = Int32()
+            msg.data = 0
+            self.task_command_pub.publish(msg)
+            self.get_logger().info('🛑 停止视觉处理')
+        else:
+            self.get_logger().warn(f'⚠️  未知的视觉模式: {mode}')
+        
         return True
     
     def publish_status(self, status):

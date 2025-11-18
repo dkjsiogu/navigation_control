@@ -1,14 +1,18 @@
 missions:
   # 自动取物任务
   auto_pickup:
-    description: "自动到 waypoint_1 并启动颜色跟踪"
+    description: "颜色跟踪去waypoint_7，切换到放置框去waypoint_6，返回start"
     tasks:
       - type: goto
-        waypoint: waypoint_1
+        waypoint: waypoint_20
       - type: wait
         duration: 1.0
-      - type: start_vision
-        task_id: 1
+      - type: goto
+        waypoint: waypoint_21
+      
+      
+
+
   
   # 返回起点
   return_home:
@@ -16,18 +20,73 @@ missions:
     tasks:
       - type: goto
         waypoint: start
-      - type: rotate
-        yaw: 0.0
+  
+  # 单次彩色追踪任务
+  color_tracking_at_7:
+    description: "去waypoint_7启动彩色追踪30秒后停止并返回"
+    tasks:
+      - type: set_vision_mode
+        mode: color_tracking
+      - type: goto
+        waypoint: waypoint_7
+      - type: wait
+        duration: 30.0
+      - type: set_vision_mode
+        mode: stop
+      - type: goto
+        waypoint: start
   
   # 完整工作流程
   complete_workflow:
-    description: "完整工作流程 - 去取物再返回"
+    description: "完整工作流程 - 2→3→4(25s)→3→2→5→6(25s)→5→7(25s)→5→8(识别框30s)→start"
     tasks:
       - type: goto
-        waypoint: waypoint_1
+        waypoint: waypoint_2
       - type: wait
-        duration: 20.0
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_3
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_4
+      - type: wait
+        duration: 25.0
+      - type: goto
+        waypoint: waypoint_3
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_2
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_5
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_6
+      - type: wait
+        duration: 25.0
+      - type: goto
+        waypoint: waypoint_5
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_7
+      - type: wait
+        duration: 25.0
+      - type: goto
+        waypoint: waypoint_5
+      - type: wait
+        duration: 1.0
+      - type: goto
+        waypoint: waypoint_8
+      - type: set_vision_mode
+        mode: 'basket_detection'
+      - type: wait
+        duration: 30.0
+      - type: set_vision_mode
+        mode: 'stop'
       - type: goto
         waypoint: start
-      - type: rotate
-        yaw: 0.0

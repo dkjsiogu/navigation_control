@@ -26,10 +26,10 @@ class AStarPlanner(Node):
     def __init__(self):
         super().__init__('astar_planner')
         
-        # 参数 - 机器人实际尺寸（从URDF）
-        self.declare_parameter('robot_length', 0.342)      # 机器人长度（米）前后
-        self.declare_parameter('robot_width', 0.300)       # 机器人宽度（米）左右
-        self.declare_parameter('safety_margin', 0.03)      # 安全裕量（米）
+        # 参数 - 机器人实际尺寸（从URDF collision box）
+        self.declare_parameter('robot_length', 0.382)      # 机器人长度（米）前后 - URDF collision
+        self.declare_parameter('robot_width', 0.340)       # 机器人宽度（米）左右 - URDF collision
+        self.declare_parameter('safety_margin', 0.05)      # 安全裕量（米）- 增加到5cm
         self.declare_parameter('smoothing_iterations', 3)  # 路径平滑迭代次数（禁用平滑）
         self.declare_parameter('waypoint_spacing', 0.15)   # 路径点间距（米）
         self.declare_parameter('diagonal_penalty', 1.5)    # 斜向移动惩罚系数
@@ -48,7 +48,7 @@ class AStarPlanner(Node):
         # 对角线半径（用于快速碰撞初筛）
         self.robot_diagonal_radius = math.sqrt(self.robot_half_length**2 + self.robot_half_width**2)
         
-        # 订阅地图 (使用map_viz而非map)
+        # 订阅地图
         self.map_sub = self.create_subscription(
             OccupancyGrid,
             '/map_viz',
@@ -77,6 +77,7 @@ class AStarPlanner(Node):
         # 地图数据
         self.map_data = None
         self.map_info = None
+        self.goal_orientation = None  # 保存目标朝向
         
         self.get_logger().info('🚀 A* 路径规划器已启动 (矩形footprint模式)')
         self.get_logger().info(f'机器人尺寸: {self.robot_length*1000:.0f}mm × {self.robot_width*1000:.0f}mm')
@@ -136,9 +137,11 @@ class AStarPlanner(Node):
                grid_y < 0 or grid_y >= self.map_info.height:
                 return False  # 超出地图范围
             
-            # 碰撞检查（占用概率 > 50% 或未知区域）
-            if self.map_data[grid_y, grid_x] > 50 or self.map_data[grid_y, grid_x] < 0:
-                return False  # 碰撞或未知
+            # 碰撞检查：只阻挡确定的障碍物（>65%占用率）
+            # 允许通过：自由空间(0)、低占用率(<65%)、未知区域(-1)
+            # 适配Cartographer实时建图模式
+            if self.map_data[grid_y, grid_x] > 65:
+                return False  # 确定的障碍物
         
         return True  # 所有角点都安全
     
@@ -147,6 +150,9 @@ class AStarPlanner(Node):
         if self.map_data is None:
             self.get_logger().warn('地图未就绪，无法规划路径')
             return
+        
+        # 保存目标朝向
+        self.goal_orientation = msg.pose.orientation
         
         # 获取当前位置
         try:
@@ -590,13 +596,19 @@ class AStarPlanner(Node):
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = frame_id
         
-        for x, y in path_world:
+        for i, (x, y) in enumerate(path_world):
             pose = PoseStamped()
             pose.header = path_msg.header
             pose.pose.position.x = x
             pose.pose.position.y = y
             pose.pose.position.z = 0.0
-            pose.pose.orientation.w = 1.0  # 无旋转
+            
+            # 最后一个点使用目标朝向，其他点无旋转
+            if i == len(path_world) - 1 and self.goal_orientation is not None:
+                pose.pose.orientation = self.goal_orientation
+            else:
+                pose.pose.orientation.w = 1.0  # 无旋转
+            
             path_msg.poses.append(pose)
         
         if raw:

@@ -16,7 +16,7 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, PoseWithCovarianceStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import Trigger, SetBool
 from std_msgs.msg import String
@@ -62,12 +62,20 @@ class WaypointManager(Node):
             Trigger, '/waypoint/delete', self.delete_waypoint_callback)
         self.goto_srv = self.create_service(
             Trigger, '/waypoint/goto', self.goto_waypoint_callback)
+        self.apply_offset_srv = self.create_service(
+            Trigger, '/waypoint/apply_relocalization_offset', self.apply_offset_callback)
         
         # 订阅 - 用于传递参数
         self.waypoint_name_sub = self.create_subscription(
             String, '/waypoint/name', self.waypoint_name_callback, 10)
         
+        # 订阅重定位消息
+        self.initialpose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/initialpose', self.initialpose_callback, 10)
+        
         self.pending_waypoint_name = None
+        self.relocalization_pose = None  # 记录ICP给出的重定位位姿
+        self.pre_relocalization_pose = None  # 记录重定位前的位姿
         
         # 发布器
         self.marker_pub = self.create_publisher(MarkerArray, '/waypoint_markers', 10)
@@ -85,6 +93,7 @@ class WaypointManager(Node):
         self.get_logger().info('   /waypoint/list   - 列出所有航点')
         self.get_logger().info('   /waypoint/delete - 删除航点')
         self.get_logger().info('   /waypoint/goto   - 前往航点')
+        self.get_logger().info('   /waypoint/apply_relocalization_offset - 应用ICP重定位偏移到所有航点')
         self.get_logger().info('')
         self.get_logger().info('💡 使用方法:')
         self.get_logger().info('   先发布名称: ros2 topic pub -1 /waypoint/name std_msgs/msg/String "{data: \'point1\'}"')
@@ -93,6 +102,119 @@ class WaypointManager(Node):
     def waypoint_name_callback(self, msg):
         """接收航点名称"""
         self.pending_waypoint_name = msg.data
+    
+    def initialpose_callback(self, msg):
+        """接收ICP重定位消息"""
+        # 先记录当前的旧位姿
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(), 
+                timeout=rclpy.duration.Duration(seconds=0.5))
+            
+            self.pre_relocalization_pose = {
+                'x': transform.transform.translation.x,
+                'y': transform.transform.translation.y,
+                'yaw': math.atan2(
+                    2.0 * (transform.transform.rotation.w * transform.transform.rotation.z + 
+                           transform.transform.rotation.x * transform.transform.rotation.y),
+                    1.0 - 2.0 * (transform.transform.rotation.y * transform.transform.rotation.y + 
+                                 transform.transform.rotation.z * transform.transform.rotation.z)
+                )
+            }
+        except Exception as e:
+            self.get_logger().warn(f'无法获取重定位前位姿: {e}')
+            return
+        
+        # 记录ICP给出的新位姿
+        quat = msg.pose.pose.orientation
+        self.relocalization_pose = {
+            'x': msg.pose.pose.position.x,
+            'y': msg.pose.pose.position.y,
+            'yaw': math.atan2(
+                2.0 * (quat.w * quat.z + quat.x * quat.y),
+                1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z)
+            )
+        }
+        
+        # 计算偏移量
+        dx = self.relocalization_pose['x'] - self.pre_relocalization_pose['x']
+        dy = self.relocalization_pose['y'] - self.pre_relocalization_pose['y']
+        dyaw = self.relocalization_pose['yaw'] - self.pre_relocalization_pose['yaw']
+        
+        # 归一化角度
+        while dyaw > math.pi:
+            dyaw -= 2 * math.pi
+        while dyaw < -math.pi:
+            dyaw += 2 * math.pi
+        
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('🎯 检测到ICP重定位!')
+        self.get_logger().info(f'   旧位姿: ({self.pre_relocalization_pose["x"]:.3f}, {self.pre_relocalization_pose["y"]:.3f}, {math.degrees(self.pre_relocalization_pose["yaw"]):.1f}°)')
+        self.get_logger().info(f'   新位姿: ({self.relocalization_pose["x"]:.3f}, {self.relocalization_pose["y"]:.3f}, {math.degrees(self.relocalization_pose["yaw"]):.1f}°)')
+        self.get_logger().info(f'   偏移量: dx={dx:.3f}m, dy={dy:.3f}m, dyaw={math.degrees(dyaw):.1f}°')
+        self.get_logger().info('   💡 执行命令更新航点: ros2 service call /waypoint/apply_relocalization_offset std_srvs/srv/Trigger')
+        self.get_logger().info('=' * 60)
+    
+    def apply_offset_callback(self, request, response):
+        """应用重定位偏移到所有航点"""
+        if self.relocalization_pose is None or self.pre_relocalization_pose is None:
+            response.success = False
+            response.message = '❌ 没有检测到重定位偏移'
+            return response
+        
+        if not self.waypoints:
+            response.success = False
+            response.message = '❌ 没有航点需要更新'
+            return response
+        
+        # 计算偏移量
+        dx = self.relocalization_pose['x'] - self.pre_relocalization_pose['x']
+        dy = self.relocalization_pose['y'] - self.pre_relocalization_pose['y']
+        dyaw = self.relocalization_pose['yaw'] - self.pre_relocalization_pose['yaw']
+        
+        # 归一化角度
+        while dyaw > math.pi:
+            dyaw -= 2 * math.pi
+        while dyaw < -math.pi:
+            dyaw += 2 * math.pi
+        
+        # 应用偏移到所有航点
+        updated_count = 0
+        self.get_logger().info('更新航点:')
+        for name, wp in self.waypoints.items():
+            old_x, old_y, old_yaw = wp['x'], wp['y'], wp['yaw']
+            
+            # 应用平移
+            wp['x'] = old_x + dx
+            wp['y'] = old_y + dy
+            
+            # 应用旋转
+            wp['yaw'] = old_yaw + dyaw
+            
+            # 归一化角度
+            while wp['yaw'] > math.pi:
+                wp['yaw'] -= 2 * math.pi
+            while wp['yaw'] < -math.pi:
+                wp['yaw'] += 2 * math.pi
+            
+            updated_count += 1
+            self.get_logger().info(
+                f'   {name}: ({old_x:.2f}, {old_y:.2f}, {math.degrees(old_yaw):.0f}°) → ({wp["x"]:.2f}, {wp["y"]:.2f}, {math.degrees(wp["yaw"]):.0f}°)')
+        
+        # 保存更新后的航点
+        if self.save_waypoints_to_file():
+            response.success = True
+            response.message = f'✅ 已更新 {updated_count} 个航点 (偏移: dx={dx:.3f}m, dy={dy:.3f}m, dyaw={math.degrees(dyaw):.1f}°)'
+            self.get_logger().info(response.message)
+            
+            # 清除记录
+            self.relocalization_pose = None
+            self.pre_relocalization_pose = None
+        else:
+            response.success = False
+            response.message = '❌ 更新成功但保存文件失败'
+        
+        return response
     
     def get_current_pose(self):
         """获取机器人当前位姿 (map 坐标系)"""
