@@ -5,17 +5,15 @@
 [![ROS2](https://img.shields.io/badge/ROS2-Humble-blue)](https://docs.ros.org/en/humble/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## � 模块组成
+## 📦 模块组成
 
 ```
 navigation_control/
 ├── launch/                     # 启动文件
-│   ├── cartographer_localization.launch.py  # 定位+导航
-│   └── mapping.launch.py                    # 建图模式
+│   └── cartographer.launch.py              # 实时建图+导航
 ├── config/                     # 配置文件
-│   ├── cartographer_localization.lua        # Cartographer纯定位配置
-│   ├── cartographer_mapping.lua             # Cartographer建图配置
-│   └── navigation_debug.rviz                # RViz可视化配置
+│   ├── cartographer.lua                    # Cartographer实时建图配置
+│   └── navigation_debug.rviz               # RViz可视化配置
 ├── scripts/                    # Python节点
 │   ├── astar_planner.py                     # A*路径规划
 │   ├── simple_goal_controller.py            # Pure Pursuit控制
@@ -33,23 +31,16 @@ navigation_control/
 
 ## 🚀 核心功能
 
-### 1️⃣ 建图模式 (Mapping)
+### 实时建图导航模式
 ```bash
-ros2 launch navigation_control mapping.launch.py
+ros2 launch navigation_control cartographer.launch.py
 ```
-- **功能**：使用 Cartographer 建立 2D 占用栅格地图
-- **数据源**：RPLIDAR A1 (8Hz) + 轮式里程计 + IMU
-- **输出**：保存为 `.pbstream` 地图文件
-
-### 2️⃣ 定位与导航模式 (Localization + Navigation)
-```bash
-ros2 launch navigation_control cartographer_localization.launch.py \
-  pbstream_file:=/path/to/my_map.pbstream
-```
-- **定位**：Cartographer 纯定位模式（加载已有地图）
+- **建图**：Cartographer 实时建图，固定起始点 (0,0)
+- **定位**：边建图边定位，支持闭环检测
 - **路径规划**：自定义 A* 算法 + 矩形机器人足迹碰撞检测
 - **路径优化**：插值 → 平滑（20次迭代）→ 曲率简化
 - **跟踪控制**：Pure Pursuit + 全向轮运动学
+- **数据融合**：RPLIDAR A1 (8Hz) + 轮式里程计 + IMU
 
 ## 🛠️ 系统架构
 
@@ -57,7 +48,7 @@ ros2 launch navigation_control cartographer_localization.launch.py \
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                     Cartographer                          │
-│  (纯定位 + 发布 map→odom TF)                              │
+│  (实时建图 + 定位 + 发布 map→odom TF)                      │
 └────────────────────────────────────────────────────────────┘
                            ↓ /map
 ┌────────────────────────────────────────────────────────────┐
@@ -163,40 +154,33 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 🎮 使用流程
 
-### 第一次使用（建图）
-1. **启动建图**
+### 启动导航系统
+1. **启动完整系统**
    ```bash
-   ros2 launch navigation_control mapping.launch.py
+   ros2 launch navigation_control cartographer.launch.py
    ```
-
-2. **遥控建图**
-   - 使用遥控器/键盘控制机器人移动
-   - 覆盖所有区域
-
-3. **保存地图**
-   ```bash
-   ros2 service call /write_state cartographer_ros_msgs/srv/WriteState \
-     "{filename: '${PWD}/src/navigation_control/maps/my_map.pbstream'}"
-   ```
-
-### 日常使用（导航）
-1. **启动定位导航**
-   ```bash
-   ros2 launch navigation_control cartographer_localization.launch.py
-   ```
+   - 机器人从 (0,0) 开始实时建图
+   - 同时支持导航功能
 
 2. **在 RViz2 中设置目标点**
    - 点击工具栏 "2D Goal Pose"
    - 在地图上点击目标位置
    - 机器人自动规划路径并执行
 
-3. **路径可视化**
-   - 黄色路径：`/raw_planned_path`（原始A*输出）
+3. **保存地图（可选）**
+   ```bash
+   ros2 service call /finish_trajectory cartographer_ros_msgs/srv/FinishTrajectory "{trajectory_id: 0}"
+   ros2 service call /write_state cartographer_ros_msgs/srv/WriteState \
+     "{filename: '${HOME}/my_map.pbstream'}"
+   ```
+
+4. **路径可视化**
+   - 实时地图：`/map`（持续更新）
    - 绿色路径：`/planned_path`（优化后的平滑路径）
 
 ## ⚙️ 关键参数调优
 
-### 路径规划参数 (`cartographer_localization.launch.py`)
+### 路径规划参数 (`cartographer.launch.py`)
 ```python
 'robot_length': 0.262,          # 机器人长度 (m)
 'robot_width': 0.270,           # 机器人宽度 (m)
@@ -230,11 +214,12 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 **现象**：转弯时路径过于笔直  
 **调优**：增加 `smoothing_iterations` 参数（当前20次）
 
-### 4. 定位失败
+### 4. 地图构建问题
 **解决方法**：
-1. 检查 `.pbstream` 地图文件路径
-2. 确保机器人在地图范围内启动
-3. Cartographer 会自动全局定位（无需手动设置初始位姿）
+1. 确保机器人从固定位置 (0,0) 启动
+2. 建图时保持机器人匀速移动
+3. 闭环检测会自动优化地图
+4. 如需重新建图，重启节点即可
 
 ## 📝 开发指南
 
@@ -245,10 +230,12 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ## 🎯 系统特性
 
 ✅ **无需 Nav2**：完全自定义导航栈，轻量高效  
+✅ **实时建图**：Cartographer 边建图边导航，无需预建图  
+✅ **固定起始点**：每次从 (0,0) 启动，坐标系一致  
+✅ **闭环检测**：自动优化地图，消除累积误差  
 ✅ **矩形碰撞检测**：精确的机器人足迹建模  
 ✅ **圆弧路径生成**：平滑过渡，避免急转弯  
 ✅ **IMU 融合**：增强角度估计精度  
-✅ **自动全局定位**：Cartographer 无需初始位姿  
 ✅ **实时障碍物过滤**：过滤机器人本体反射
 
 ## 📄 许可证
